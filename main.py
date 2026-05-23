@@ -9,20 +9,33 @@ from nicegui import ui as ng
 
 # --- Cluster placement ---
 _CLUSTER_PLACEMENT_ATTEMPTS = 300
-_CLUSTER_PLACEMENT_FRAC = 0.85    # area centers within this fraction of brain_radius
-_BETA_A = 2.2                     # Beta shape a — brain-like inner-region density bias
-_BETA_B = 4.8                     # Beta shape b
+_CLUSTER_PLACEMENT_FRAC = 0.85
+_BETA_A = 2.2
+_BETA_B = 4.8
 
 # --- Connectivity ---
-_SMALL_WORLD_RATE = 0.008         # extra cross-area bridges per neuron in brain-like mode
+_SMALL_WORLD_RATE = 0.008
 
 # --- Visualization ---
 _LOCAL_EDGE_OPACITY = 0.35
-_CROSS_EDGE_COLOR = "rgba(245, 77, 77, 0.7)"
+# Red is reserved for cross-area bridges — no palette color may be a red shade.
+_CROSS_EDGE_COLOR = "rgba(215, 55, 55, 0.75)"
 _CLUSTER_PALETTE = [
-    "#2EC4B6", "#FF9F1C", "#E71D36", "#3A86FF", "#8338EC",
-    "#06D6A0", "#F15BB5", "#8AC926", "#1982C4", "#FFCA3A",
+    "#2EC4B6",  # teal
+    "#FF9F1C",  # amber
+    "#5BC0EB",  # sky cyan
+    "#8338EC",  # violet
+    "#06D6A0",  # emerald
+    "#F15BB5",  # pink
+    "#8AC926",  # lime
+    "#3A86FF",  # cornflower blue
+    "#FFCA3A",  # yellow
+    "#B5179E",  # magenta
 ]
+
+_SIDEBAR_BG = "#0e0e1a"
+_PAGE_BG = "#080810"
+_ACCENT = "#2EC4B6"
 
 
 def _hex_to_rgba(hex_color: str, alpha: float) -> str:
@@ -70,7 +83,6 @@ def generate_clusters(
 ) -> list[Cluster]:
     clusters: list[Cluster] = []
     placement_radius = max(1.0, brain_radius * _CLUSTER_PLACEMENT_FRAC)
-    # Enforce minimum separation so no two Voronoi seeds are trivially close.
     min_separation = max(1.5, brain_radius / (2.0 * num_clusters))
 
     for cluster_id in range(num_clusters):
@@ -95,9 +107,9 @@ def generate_neurons(
     brain_like_mode: bool,
 ) -> list[Neuron]:
     neurons: list[Neuron] = []
-    for neuron_id in range(num_neurons):
+    for nid in range(num_neurons):
         r = brain_radius * (rng.beta(_BETA_A, _BETA_B) if brain_like_mode else rng.random() ** (1.0 / 3.0))
-        neurons.append(Neuron(id=neuron_id, cluster_id=0, position=_random_unit(rng) * r))
+        neurons.append(Neuron(id=nid, cluster_id=0, position=_random_unit(rng) * r))
     return neurons
 
 
@@ -105,11 +117,9 @@ def assign_clusters(neurons: list[Neuron], clusters: list[Cluster]) -> None:
     """Voronoi partition: assign each neuron to its nearest cluster center."""
     for cluster in clusters:
         cluster.neuron_ids = []
-
     centers = np.array([c.center for c in clusters], dtype=float)
     positions = np.array([n.position for n in neurons], dtype=float)
     dists = np.linalg.norm(positions[:, None, :] - centers[None, :, :], axis=2)
-
     for neuron_idx, cluster_idx in enumerate(np.argmin(dists, axis=1)):
         cid = int(cluster_idx)
         neurons[neuron_idx].cluster_id = clusters[cid].id
@@ -128,7 +138,7 @@ def build_connections(
     positions = np.array([n.position for n in neurons], dtype=float)
     seen: set[tuple[int, int]] = set()
 
-    # Local: connect each neuron to its k nearest neighbors within the same area.
+    # Local: k-nearest neighbors within each area.
     for cluster in clusters:
         ids = np.array(cluster.neuron_ids, dtype=int)
         if ids.size < 2:
@@ -155,13 +165,15 @@ def build_connections(
             right_ids = clusters[right].neuron_ids
             if not left_ids or not right_ids:
                 continue
-            smaller, larger = (left_ids, right_ids) if len(left_ids) <= len(right_ids) else (right_ids, left_ids)
+            smaller, larger = (
+                (left_ids, right_ids) if len(left_ids) <= len(right_ids) else (right_ids, left_ids)
+            )
             for i in smaller:
                 if rng.random() < p_cross:
                     j = int(rng.choice(larger))
                     edges.append(Edge(source=int(i), target=j, weight=0.4, type="cross", cluster_id=-1))
 
-    # Small-world augmentation: a few extra random cross-area bridges in brain-like mode.
+    # Small-world: sparse extra cross-area bridges in brain-like mode.
     if brain_like_mode and len(neurons) > 3:
         for _ in range(max(1, int(_SMALL_WORLD_RATE * len(neurons)))):
             i = int(rng.integers(0, len(neurons)))
@@ -186,7 +198,7 @@ def visualize(
         go.Scatter3d(
             x=positions[:, 0], y=positions[:, 1], z=positions[:, 2],
             mode="markers",
-            marker={"size": 2.6, "color": neuron_colors, "opacity": 0.9},
+            marker={"size": 2.8, "color": neuron_colors, "opacity": 0.92},
             name="neurons",
             hovertemplate="Neuron %{pointNumber}<extra></extra>",
         )
@@ -228,12 +240,13 @@ def visualize(
         fig.add_trace(go.Scatter3d(
             x=cross_x, y=cross_y, z=cross_z,
             mode="lines",
-            line={"width": 1.8, "color": _CROSS_EDGE_COLOR},
+            line={"width": 2.0, "color": _CROSS_EDGE_COLOR},
             hoverinfo="skip",
             name="cross-area",
         ))
 
-    axis_cfg = {"visible": False, "range": [-brain_radius, brain_radius], "showgrid": False, "zeroline": False}
+    r = brain_radius
+    axis_cfg = {"visible": False, "range": [-r, r], "showgrid": False, "zeroline": False}
     fig.update_layout(
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         paper_bgcolor="rgba(0,0,0,0)",
@@ -251,7 +264,45 @@ def visualize(
 
 
 def ui() -> None:
-    container = ng.column().classes("w-full")
+    ng.dark_mode(value=True)
+    ng.add_head_html(f"""<style>
+      html, body, .q-page, .q-layout {{
+        background: {_PAGE_BG} !important;
+        margin: 0; padding: 0;
+      }}
+      .nicegui-content {{
+        padding: 0 !important;
+        max-width: 100% !important;
+      }}
+      .sidebar {{
+        background: {_SIDEBAR_BG};
+        border-right: 1px solid #1c1c2e;
+      }}
+      .section-label {{
+        font-size: 0.58rem;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        color: {_ACCENT};
+        padding-top: 0.6rem;
+        padding-bottom: 0.1rem;
+      }}
+      .stat-text {{
+        font-size: 0.64rem;
+        color: #44445a;
+        line-height: 1.7;
+        font-variant-numeric: tabular-nums;
+      }}
+      .q-slider__thumb {{ transition: none !important; }}
+      ::-webkit-scrollbar {{ width: 4px; }}
+      ::-webkit-scrollbar-track {{ background: transparent; }}
+      ::-webkit-scrollbar-thumb {{ background: #222235; border-radius: 2px; }}
+    </style>""")
+
+    def divider() -> None:
+        ng.separator().style("background: #1a1a2c; height: 1px; border: none; margin: 0.25rem 0;")
+
+    def section(text: str) -> None:
+        ng.label(text).classes("section-label")
 
     def slider_field(
         label: str,
@@ -261,63 +312,80 @@ def ui() -> None:
         step: float,
         formatter: Callable[[float], str],
     ):
-        with ng.column().style("width: 520px; gap: 0.15rem;"):
-            with ng.row().classes("w-full items-center justify-between"):
-                ng.label(label)
-                value_label = ng.label()
-            slider = ng.slider(min=min_value, max=max_value, value=value, step=step).classes("w-full")
+        with ng.column().style("gap: 0.05rem;"):
+            with ng.row().classes("w-full items-center justify-between").style("gap: 0.5rem;"):
+                ng.label(label).style("font-size: 0.71rem; color: #606080;")
+                value_label = ng.label().style(
+                    "font-size: 0.71rem; color: #c8c8e0; font-weight: 600; "
+                    "font-variant-numeric: tabular-nums; white-space: nowrap;"
+                )
+            slider = (
+                ng.slider(min=min_value, max=max_value, value=value, step=step)
+                .classes("w-full")
+                .props("color=teal dense")
+            )
             value_label.bind_text_from(slider, "value", backward=formatter)
         return slider
 
-    with ng.row().style("width: 100%; gap: 20px; align-items: flex-start; flex-wrap: wrap;"):
-        with ng.column().style("flex: 0 0 560px; max-width: 560px; gap: 0.55rem;"):
-            ng.label("Cerebryx Brain-Topology Simulator").classes("text-h5")
-            ng.label(
-                "One unified brain — areas by Voronoi partition, k-nearest local wiring, red cross-area bridges."
-            ).classes("text-caption")
+    # ── Full-viewport flex layout ─────────────────────────────────────────────
+    with ng.row().style(f"height:100vh; width:100%; overflow:hidden; gap:0; background:{_PAGE_BG};"):
 
-            ng.separator()
-            ng.label("Structure").classes("text-subtitle2")
-            num_areas = slider_field("Number of areas", 2, 12, 6, 1, lambda v: f"{int(v)}")
-            neurons_min = slider_field("Min neurons per area", 10, 200, 40, 5, lambda v: f"{int(v)}")
-            neurons_max = slider_field("Max neurons per area", 10, 300, 120, 5, lambda v: f"{int(v)}")
-
-            ng.separator()
-            ng.label("Connectivity").classes("text-subtitle2")
-            k_neighbors = slider_field(
-                "Local neighbors (K) — each neuron connects to its K nearest in-area neighbors",
-                1, 12, 4, 1, lambda v: f"{int(v)}",
+        # ── Sidebar ───────────────────────────────────────────────────────────
+        with ng.column().classes("sidebar").style(
+            "width:300px; min-width:300px; height:100vh; overflow-y:auto; "
+            "padding:1.3rem 1.05rem 1.1rem; gap:0.3rem;"
+        ):
+            # Brand
+            ng.label("CEREBRYX").style(
+                f"font-size:1.25rem; font-weight:800; letter-spacing:0.24em; color:{_ACCENT};"
             )
-            p_cross = slider_field(
-                "Cross-area bridge probability — chance each neuron bridges to another area",
-                0.000, 0.150, 0.020, 0.005, lambda v: f"{float(v):.3f}",
+            ng.label("Brain Topology Simulator").style(
+                "font-size:0.65rem; color:#303048; margin-top:-0.15rem; margin-bottom:0.4rem;"
             )
 
-            ng.separator()
-            ng.label("Global").classes("text-subtitle2")
-            brain_like_mode = ng.switch("Brain-like mode  (denser core, small-world bridges)", value=True)
+            divider()
+            section("STRUCTURE")
+            num_areas   = slider_field("Areas", 2, 12, 6, 1, lambda v: f"{int(v)}")
+            neurons_min = slider_field("Min neurons / area", 10, 200, 40, 5, lambda v: f"{int(v)}")
+            neurons_max = slider_field("Max neurons / area", 10, 300, 120, 5, lambda v: f"{int(v)}")
+
+            divider()
+            section("CONNECTIVITY")
+            k_neighbors = slider_field("Local neighbors  K", 1, 12, 4, 1, lambda v: f"{int(v)}")
+            p_cross     = slider_field("Cross-area bridges", 0.000, 0.150, 0.020, 0.005, lambda v: f"{v:.3f}")
+
+            divider()
+            section("OPTIONS")
+            with ng.row().classes("items-center justify-between w-full").style("padding:0.1rem 0;"):
+                with ng.column().style("gap:0.05rem;"):
+                    ng.label("Brain-like mode").style("font-size:0.71rem; color:#606080;")
+                    ng.label("Dense core · small-world bridges").style("font-size:0.6rem; color:#303048;")
+                brain_like_mode = ng.switch("", value=True).props("color=teal dense")
             seed = slider_field("Random seed", 0, 9999, 42, 1, lambda v: f"{int(v)}")
 
-            ng.separator()
-            stats = ng.label("Ready").classes("text-caption")
-            ng.button("Generate Brain", on_click=lambda: regenerate()).props("color=primary")
+            divider()
+            ng.button("GENERATE BRAIN", on_click=lambda: regenerate()).classes("w-full").props(
+                "color=teal unelevated"
+            ).style("font-weight:700; letter-spacing:0.07em; margin-top:0.2rem;")
 
-        plot_holder = ng.column().style("flex: 1 1 740px; min-height: 80vh;")
+            stats = ng.label("—").classes("stat-text").style("margin-top:0.3rem;")
+
+        # ── 3-D plot ──────────────────────────────────────────────────────────
+        plot_holder = ng.column().style(
+            f"flex:1 1 0; height:100vh; overflow:hidden; background:{_PAGE_BG};"
+        )
 
     def regenerate() -> None:
         rng = np.random.default_rng(int(seed.value))
         n_areas = int(num_areas.value)
         n_min = min(int(neurons_min.value), int(neurons_max.value))
         n_max = max(int(neurons_min.value), int(neurons_max.value))
-
         brain_radius = 28.0
+
         clusters = generate_clusters(n_areas, brain_radius, rng, bool(brain_like_mode.value))
-
-        # Each area contributes a random neuron count in [n_min, n_max].
-        area_counts = [int(rng.integers(n_min, n_max + 1)) for _ in range(n_areas)]
-        neurons = generate_neurons(sum(area_counts), brain_radius, rng, bool(brain_like_mode.value))
+        total = sum(int(rng.integers(n_min, n_max + 1)) for _ in range(n_areas))
+        neurons = generate_neurons(total, brain_radius, rng, bool(brain_like_mode.value))
         assign_clusters(neurons, clusters)
-
         edges = build_connections(
             neurons, clusters,
             k_local=int(k_neighbors.value),
@@ -329,18 +397,18 @@ def ui() -> None:
 
         plot_holder.clear()
         with plot_holder:
-            ng.plotly(fig).style("width: 100%; height: 80vh;")
+            ng.plotly(fig).style("width:100%; height:100vh;")
 
         local_count = sum(1 for e in edges if e.type == "local")
-        actual_sizes = sorted(len(c.neuron_ids) for c in clusters)
+        sizes = sorted(len(c.neuron_ids) for c in clusters)
         stats.text = (
-            f"{n_areas} areas · {len(neurons)} neurons  (per area: {actual_sizes}) · "
-            f"{local_count} local edges · {len(edges) - local_count} cross-area bridges"
+            f"{n_areas} areas  ·  {len(neurons)} neurons\n"
+            f"{local_count} local edges  ·  {len(edges) - local_count} cross-area\n"
+            f"per area: {sizes}"
         )
 
-    with container:
-        regenerate()
+    regenerate()
 
 
 ui()
-ng.run(title="Cerebryx Brain Topology Simulator")
+ng.run(title="Cerebryx")
