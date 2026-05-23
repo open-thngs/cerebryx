@@ -321,6 +321,7 @@ def visualize(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
+        uirevision=1,
         scene={
             "xaxis": axis_cfg,
             "yaxis": axis_cfg,
@@ -533,13 +534,22 @@ def ui() -> None:
             show_bridges=state.get("show_bridges", True),
             hidden_areas=state.get("hidden_areas"),
         )
-        # Soft rerender: update figure in-place so Plotly.react() is used and
-        # the 3-D camera position is preserved.  Hard rerender (after generate)
-        # recreates the element to pick up any structural changes.
+        # Inject the saved camera so both Plotly.react and Plotly.newPlot
+        # render at the correct position (guards against the async-load race
+        # where last_options is still null on the first soft render).
+        if state.get("camera"):
+            fig.update_layout(scene_camera=state["camera"])
+
         if hard or "plot_el" not in state:
             plot_container.clear()
             with plot_container:
                 state["plot_el"] = ng.plotly(fig).style("width:100%; height:100vh;")
+
+            def _on_relayout(e: object) -> None:
+                if isinstance(e.args, dict) and "scene.camera" in e.args:
+                    state["camera"] = e.args["scene.camera"]
+
+            state["plot_el"].on("plotly_relayout", _on_relayout)
         else:
             state["plot_el"].update_figure(fig)
         _rebuild_legend()
@@ -566,6 +576,7 @@ def ui() -> None:
             "edges":        edges,
             "brain_radius": brain_r,
             "hidden_areas": set(),
+            "camera":       None,
         })
         rerender(hard=True)
 
