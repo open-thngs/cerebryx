@@ -13,6 +13,18 @@ Cerebryx is not a traditional AI system. Instead, it is an exploration of struct
 
 ---
 
+## Screenshots
+
+**Brain-like mode** — neurons concentrate toward the core with a biologically inspired density distribution, producing a rich, spread-out topology:
+
+![Brain-like mode](img/screenshot001.png)
+
+**Normal mode** — neurons are distributed uniformly across the sphere, forming a compact and evenly connected structure:
+
+![Normal mode](img/screenshot002.png)
+
+---
+
 ## Concept
 
 In Cerebryx, a "brain" is not defined by a model or algorithm, but by structure:
