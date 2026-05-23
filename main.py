@@ -9,39 +9,40 @@ from nicegui import ui as ng
 
 # --- Cluster placement ---
 _CLUSTER_PLACEMENT_ATTEMPTS = 300
-_CLUSTER_EDGE_MARGIN = 1.2        # clusters kept this * spread inside brain_radius
-_MIN_SEP_SCALE = 0.8              # min separation = max(this * spread, _MIN_SEP_ABS)
-_MIN_SEP_ABS = 1.5
-_BETA_A = 2.2                     # Beta shape a for brain-like inner-region bias
+_CLUSTER_PLACEMENT_FRAC = 0.85    # area centers within this fraction of brain_radius
+_BETA_A = 2.2                     # Beta shape a — brain-like inner-region density bias
 _BETA_B = 4.8                     # Beta shape b
 
-# --- Neuron placement ---
-_NEURON_PLACEMENT_ATTEMPTS = 60
-_NEURON_SCALE = 0.48              # normal spread within cluster (fraction of radius)
-_NEURON_MAX_FRAC = 0.95           # fallback: max fraction of cluster radius
-_NEURON_EDGE_FRAC = 0.08          # fallback: max fraction of brain radius at boundary
-
 # --- Connectivity ---
-_BRAIN_LIKE_SCALE = 1.35          # connection density multiplier in brain-like mode
-_LONG_RANGE_ATTEMPT_FRAC = 0.06
-_LONG_RANGE_SIGMA_MULT = 1.8
-_SMALL_WORLD_RATE = 0.008
-_SMALL_WORLD_SIGMA_MULT = 2.3
+_SMALL_WORLD_RATE = 0.008         # extra cross-area bridges per neuron in brain-like mode
 
 # --- Visualization ---
-_SPHERE_THETA = 22
-_SPHERE_PHI = 16
+_LOCAL_EDGE_OPACITY = 0.35
+_CROSS_EDGE_COLOR = "rgba(245, 77, 77, 0.7)"
 _CLUSTER_PALETTE = [
     "#2EC4B6", "#FF9F1C", "#E71D36", "#3A86FF", "#8338EC",
     "#06D6A0", "#F15BB5", "#8AC926", "#1982C4", "#FFCA3A",
 ]
 
 
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _random_unit(rng: np.random.Generator) -> np.ndarray:
+    v = rng.normal(size=3)
+    norm = np.linalg.norm(v)
+    while norm == 0.0:
+        v = rng.normal(size=3)
+        norm = np.linalg.norm(v)
+    return v / norm
+
+
 @dataclass
 class Cluster:
     id: int
     center: np.ndarray
-    radius: float
     neuron_ids: list[int] = field(default_factory=list)
 
 
@@ -57,220 +58,179 @@ class Edge:
     source: int
     target: int
     weight: float
-    type: Literal["local", "long"]
-
-
-def gaussian_prob(distance: float | np.ndarray, sigma: float) -> float | np.ndarray:
-    safe_sigma = max(0.05, float(sigma))
-    return np.exp(-(distance**2) / (2.0 * safe_sigma**2))
-
-
-def random_point_in_sphere(radius: float, rng: np.random.Generator) -> np.ndarray:
-    direction = rng.normal(size=3)
-    norm = np.linalg.norm(direction)
-    while norm == 0.0:
-        direction = rng.normal(size=3)
-        norm = np.linalg.norm(direction)
-    return direction / norm * (radius * (rng.random() ** (1.0 / 3.0)))
+    type: Literal["local", "cross"]
+    cluster_id: int  # owning area for local edges, -1 for cross-area
 
 
 def generate_clusters(
     num_clusters: int,
     brain_radius: float,
-    cluster_spread: float,
     rng: np.random.Generator,
     brain_like_mode: bool,
 ) -> list[Cluster]:
     clusters: list[Cluster] = []
-    min_separation = max(_MIN_SEP_SCALE * cluster_spread, _MIN_SEP_ABS)
-    placement_radius = max(1.0, brain_radius - _CLUSTER_EDGE_MARGIN * cluster_spread)
+    placement_radius = max(1.0, brain_radius * _CLUSTER_PLACEMENT_FRAC)
+    # Enforce minimum separation so no two Voronoi seeds are trivially close.
+    min_separation = max(1.5, brain_radius / (2.0 * num_clusters))
 
     for cluster_id in range(num_clusters):
         placed = False
         for _ in range(_CLUSTER_PLACEMENT_ATTEMPTS):
-            if brain_like_mode:
-                r = max(1.0, placement_radius * rng.beta(_BETA_A, _BETA_B))
-                center = random_point_in_sphere(r, rng)
-            else:
-                center = random_point_in_sphere(placement_radius, rng)
-
+            r = placement_radius * (rng.beta(_BETA_A, _BETA_B) if brain_like_mode else rng.random() ** (1.0 / 3.0))
+            center = _random_unit(rng) * max(1.0, r)
             if not clusters or min(np.linalg.norm(center - c.center) for c in clusters) >= min_separation:
                 placed = True
                 break
-
         if not placed:
-            center = random_point_in_sphere(max(1.0, brain_radius - cluster_spread), rng)
-
-        clusters.append(Cluster(id=cluster_id, center=center, radius=cluster_spread))
+            center = _random_unit(rng) * placement_radius
+        clusters.append(Cluster(id=cluster_id, center=center))
 
     return clusters
 
 
 def generate_neurons(
-    clusters: list[Cluster],
-    neurons_per_cluster: int,
+    num_neurons: int,
     brain_radius: float,
     rng: np.random.Generator,
+    brain_like_mode: bool,
 ) -> list[Neuron]:
     neurons: list[Neuron] = []
-    neuron_id = 0
-
-    for cluster in clusters:
-        for _ in range(neurons_per_cluster):
-            for _attempt in range(_NEURON_PLACEMENT_ATTEMPTS):
-                point = cluster.center + rng.normal(scale=cluster.radius * _NEURON_SCALE, size=3)
-                if np.linalg.norm(point) <= brain_radius:
-                    break
-            else:
-                direction = point - cluster.center
-                norm = float(np.linalg.norm(direction)) + 1e-9
-                point = cluster.center + direction / norm * min(
-                    cluster.radius * _NEURON_MAX_FRAC, brain_radius * _NEURON_EDGE_FRAC
-                )
-
-            neurons.append(Neuron(id=neuron_id, cluster_id=cluster.id, position=point))
-            cluster.neuron_ids.append(neuron_id)
-            neuron_id += 1
-
+    for neuron_id in range(num_neurons):
+        r = brain_radius * (rng.beta(_BETA_A, _BETA_B) if brain_like_mode else rng.random() ** (1.0 / 3.0))
+        neurons.append(Neuron(id=neuron_id, cluster_id=0, position=_random_unit(rng) * r))
     return neurons
+
+
+def assign_clusters(neurons: list[Neuron], clusters: list[Cluster]) -> None:
+    """Voronoi partition: assign each neuron to its nearest cluster center."""
+    for cluster in clusters:
+        cluster.neuron_ids = []
+
+    centers = np.array([c.center for c in clusters], dtype=float)
+    positions = np.array([n.position for n in neurons], dtype=float)
+    dists = np.linalg.norm(positions[:, None, :] - centers[None, :, :], axis=2)
+
+    for neuron_idx, cluster_idx in enumerate(np.argmin(dists, axis=1)):
+        cid = int(cluster_idx)
+        neurons[neuron_idx].cluster_id = clusters[cid].id
+        clusters[cid].neuron_ids.append(neuron_idx)
 
 
 def build_connections(
     neurons: list[Neuron],
     clusters: list[Cluster],
-    sigma: float,
-    p_long: float,
+    k_local: int,
+    p_cross: float,
     rng: np.random.Generator,
     brain_like_mode: bool,
 ) -> list[Edge]:
     edges: list[Edge] = []
-    scale = _BRAIN_LIKE_SCALE if brain_like_mode else 1.0
-
     positions = np.array([n.position for n in neurons], dtype=float)
+    seen: set[tuple[int, int]] = set()
 
+    # Local: connect each neuron to its k nearest neighbors within the same area.
     for cluster in clusters:
         ids = np.array(cluster.neuron_ids, dtype=int)
         if ids.size < 2:
             continue
-
         local_pos = positions[ids]
         dist = np.linalg.norm(local_pos[:, None, :] - local_pos[None, :, :], axis=2)
-        prob = gaussian_prob(dist, sigma) * scale
-        np.fill_diagonal(prob, 0.0)
-        upper_i, upper_j = np.triu_indices(ids.size, k=1)
-        accepted = rng.random(size=upper_i.size) < np.clip(prob[upper_i, upper_j], 0.0, 1.0)
+        np.fill_diagonal(dist, np.inf)
+        k = min(k_local, ids.size - 1)
+        for i_local in range(ids.size):
+            for j_local in np.argsort(dist[i_local])[:k]:
+                i_g, j_g = int(ids[i_local]), int(ids[int(j_local)])
+                key = (min(i_g, j_g), max(i_g, j_g))
+                if key in seen:
+                    continue
+                seen.add(key)
+                d = float(dist[i_local, int(j_local)])
+                weight = float(np.clip(1.0 / (1.0 + d * 0.3), 0.05, 1.0))
+                edges.append(Edge(source=i_g, target=j_g, weight=weight, type="local", cluster_id=cluster.id))
 
-        for idx in np.where(accepted)[0]:
-            i, j = ids[upper_i[idx]], ids[upper_j[idx]]
-            weight = float(np.clip(prob[upper_i[idx], upper_j[idx]], 0.05, 1.0))
-            edges.append(Edge(source=int(i), target=int(j), weight=weight, type="local"))
-
-    p_long_eff = float(np.clip(p_long * scale, 0.0, 1.0))
+    # Cross-area: each neuron in the smaller area independently tries to bridge once.
     for left in range(len(clusters)):
         for right in range(left + 1, len(clusters)):
             left_ids = clusters[left].neuron_ids
             right_ids = clusters[right].neuron_ids
             if not left_ids or not right_ids:
                 continue
+            smaller, larger = (left_ids, right_ids) if len(left_ids) <= len(right_ids) else (right_ids, left_ids)
+            for i in smaller:
+                if rng.random() < p_cross:
+                    j = int(rng.choice(larger))
+                    edges.append(Edge(source=int(i), target=j, weight=0.4, type="cross", cluster_id=-1))
 
-            attempts = max(1, int(np.ceil((len(left_ids) + len(right_ids)) * p_long_eff * _LONG_RANGE_ATTEMPT_FRAC)))
-            for _ in range(attempts):
-                if rng.random() > p_long_eff:
-                    continue
-                i = int(rng.choice(left_ids))
-                j = int(rng.choice(right_ids))
-                d = float(np.linalg.norm(positions[i] - positions[j]))
-                weight = float(np.clip(0.7 * gaussian_prob(d, _LONG_RANGE_SIGMA_MULT * sigma), 0.03, 0.8))
-                edges.append(Edge(source=i, target=j, weight=weight, type="long"))
-
+    # Small-world augmentation: a few extra random cross-area bridges in brain-like mode.
     if brain_like_mode and len(neurons) > 3:
         for _ in range(max(1, int(_SMALL_WORLD_RATE * len(neurons)))):
             i = int(rng.integers(0, len(neurons)))
             j = int(rng.integers(0, len(neurons)))
-            if i == j or neurons[i].cluster_id == neurons[j].cluster_id:
-                continue
-            d = float(np.linalg.norm(positions[i] - positions[j]))
-            weight = float(np.clip(0.55 * gaussian_prob(d, _SMALL_WORLD_SIGMA_MULT * sigma), 0.02, 0.65))
-            edges.append(Edge(source=i, target=j, weight=weight, type="long"))
+            if i != j and neurons[i].cluster_id != neurons[j].cluster_id:
+                edges.append(Edge(source=i, target=j, weight=0.3, type="cross", cluster_id=-1))
 
     return edges
 
 
-def make_sphere_surface(center: np.ndarray, radius: float, color: str) -> go.Surface:
-    theta = np.linspace(0, 2 * np.pi, _SPHERE_THETA)
-    phi = np.linspace(0, np.pi, _SPHERE_PHI)
-    x = center[0] + radius * np.outer(np.cos(theta), np.sin(phi))
-    y = center[1] + radius * np.outer(np.sin(theta), np.sin(phi))
-    z = center[2] + radius * np.outer(np.ones_like(theta), np.cos(phi))
-    return go.Surface(
-        x=x, y=y, z=z,
-        opacity=0.1,
-        showscale=False,
-        colorscale=[[0, color], [1, color]],
-        hoverinfo="skip",
-        name="cluster volume",
-    )
-
-
 def visualize(
     neurons: list[Neuron],
-    clusters: list[Cluster],
     edges: list[Edge],
     brain_radius: float,
-    max_edges_render: int = 2600,
+    max_edges_render: int = 4000,
 ) -> go.Figure:
     fig = go.Figure()
     positions = np.array([n.position for n in neurons], dtype=float)
-    cluster_ids = np.array([n.cluster_id for n in neurons], dtype=int)
-
-    for cluster in clusters:
-        color = _CLUSTER_PALETTE[cluster.id % len(_CLUSTER_PALETTE)]
-        fig.add_trace(make_sphere_surface(cluster.center, cluster.radius, color))
+    neuron_colors = [_CLUSTER_PALETTE[n.cluster_id % len(_CLUSTER_PALETTE)] for n in neurons]
 
     fig.add_trace(
         go.Scatter3d(
             x=positions[:, 0], y=positions[:, 1], z=positions[:, 2],
             mode="markers",
-            marker={"size": 2.6, "color": cluster_ids, "colorscale": "Turbo", "opacity": 0.95},
+            marker={"size": 2.6, "color": neuron_colors, "opacity": 0.9},
             name="neurons",
             hovertemplate="Neuron %{pointNumber}<extra></extra>",
         )
     )
 
-    local_x: list[float | None] = []
-    local_y: list[float | None] = []
-    local_z: list[float | None] = []
-    long_x: list[float | None] = []
-    long_y: list[float | None] = []
-    long_z: list[float | None] = []
+    local_by_cluster: dict[int, tuple[list[float | None], list[float | None], list[float | None]]] = {}
+    cross_x: list[float | None] = []
+    cross_y: list[float | None] = []
+    cross_z: list[float | None] = []
 
     for edge in edges[:max_edges_render]:
         p1, p2 = positions[edge.source], positions[edge.target]
+        xs: list[float | None] = [float(p1[0]), float(p2[0]), None]
+        ys: list[float | None] = [float(p1[1]), float(p2[1]), None]
+        zs: list[float | None] = [float(p1[2]), float(p2[2]), None]
         if edge.type == "local":
-            local_x += [float(p1[0]), float(p2[0]), None]
-            local_y += [float(p1[1]), float(p2[1]), None]
-            local_z += [float(p1[2]), float(p2[2]), None]
+            if edge.cluster_id not in local_by_cluster:
+                local_by_cluster[edge.cluster_id] = ([], [], [])
+            lx, ly, lz = local_by_cluster[edge.cluster_id]
+            lx += xs
+            ly += ys
+            lz += zs
         else:
-            long_x += [float(p1[0]), float(p2[0]), None]
-            long_y += [float(p1[1]), float(p2[1]), None]
-            long_z += [float(p1[2]), float(p2[2]), None]
+            cross_x += xs
+            cross_y += ys
+            cross_z += zs
 
-    if local_x:
+    for cid, (lx, ly, lz) in local_by_cluster.items():
+        color = _CLUSTER_PALETTE[cid % len(_CLUSTER_PALETTE)]
         fig.add_trace(go.Scatter3d(
-            x=local_x, y=local_y, z=local_z,
+            x=lx, y=ly, z=lz,
             mode="lines",
-            line={"width": 1.1, "color": "rgba(35, 142, 107, 0.42)"},
+            line={"width": 1.0, "color": _hex_to_rgba(color, _LOCAL_EDGE_OPACITY)},
             hoverinfo="skip",
-            name="local",
+            name=f"area {cid}",
         ))
 
-    if long_x:
+    if cross_x:
         fig.add_trace(go.Scatter3d(
-            x=long_x, y=long_y, z=long_z,
+            x=cross_x, y=cross_y, z=cross_z,
             mode="lines",
-            line={"width": 1.5, "color": "rgba(245, 77, 77, 0.5)"},
+            line={"width": 1.8, "color": _CROSS_EDGE_COLOR},
             hoverinfo="skip",
-            name="long-range",
+            name="cross-area",
         ))
 
     axis_cfg = {"visible": False, "range": [-brain_radius, brain_radius], "showgrid": False, "zeroline": False}
@@ -312,48 +272,70 @@ def ui() -> None:
     with ng.row().style("width: 100%; gap: 20px; align-items: flex-start; flex-wrap: wrap;"):
         with ng.column().style("flex: 0 0 560px; max-width: 560px; gap: 0.55rem;"):
             ng.label("Cerebryx Brain-Topology Simulator").classes("text-h5")
-            ng.label("3D clustered neuromorphic network with local and long-range connectivity.").classes(
-                "text-caption"
+            ng.label(
+                "One unified brain — areas by Voronoi partition, k-nearest local wiring, red cross-area bridges."
+            ).classes("text-caption")
+
+            ng.separator()
+            ng.label("Structure").classes("text-subtitle2")
+            num_areas = slider_field("Number of areas", 2, 12, 6, 1, lambda v: f"{int(v)}")
+            neurons_min = slider_field("Min neurons per area", 10, 200, 40, 5, lambda v: f"{int(v)}")
+            neurons_max = slider_field("Max neurons per area", 10, 300, 120, 5, lambda v: f"{int(v)}")
+
+            ng.separator()
+            ng.label("Connectivity").classes("text-subtitle2")
+            k_neighbors = slider_field(
+                "Local neighbors (K) — each neuron connects to its K nearest in-area neighbors",
+                1, 12, 4, 1, lambda v: f"{int(v)}",
+            )
+            p_cross = slider_field(
+                "Cross-area bridge probability — chance each neuron bridges to another area",
+                0.000, 0.150, 0.020, 0.005, lambda v: f"{float(v):.3f}",
             )
 
-            num_clusters = slider_field("Number of clusters", 2, 18, 8, 1, lambda v: f"{int(v)}")
-            neurons_per_cluster = slider_field("Neurons per cluster", 20, 300, 90, 5, lambda v: f"{int(v)}")
-            cluster_spread = slider_field("Cluster spread (radius)", 0.7, 6.0, 2.1, 0.1, lambda v: f"{float(v):.1f}")
-            sigma = slider_field("Sigma (locality)", 0.25, 7.5, 1.8, 0.05, lambda v: f"{float(v):.2f}")
-            long_prob = slider_field(
-                "Long-range connection probability", 0.0, 0.2, 0.03, 0.005, lambda v: f"{float(v):.3f}"
-            )
-            brain_radius = slider_field("Brain sphere radius", 12.0, 55.0, 28.0, 1.0, lambda v: f"{float(v):.0f}")
+            ng.separator()
+            ng.label("Global").classes("text-subtitle2")
+            brain_like_mode = ng.switch("Brain-like mode  (denser core, small-world bridges)", value=True)
             seed = slider_field("Random seed", 0, 9999, 42, 1, lambda v: f"{int(v)}")
-            brain_like_mode = ng.switch("Brain-like mode", value=True)
 
-            stats = ng.label("Ready")
+            ng.separator()
+            stats = ng.label("Ready").classes("text-caption")
             ng.button("Generate Brain", on_click=lambda: regenerate()).props("color=primary")
 
         plot_holder = ng.column().style("flex: 1 1 740px; min-height: 80vh;")
 
     def regenerate() -> None:
         rng = np.random.default_rng(int(seed.value))
-        clusters = generate_clusters(
-            int(num_clusters.value), float(brain_radius.value), float(cluster_spread.value),
-            rng, bool(brain_like_mode.value),
-        )
-        neurons = generate_neurons(clusters, int(neurons_per_cluster.value), float(brain_radius.value), rng)
+        n_areas = int(num_areas.value)
+        n_min = min(int(neurons_min.value), int(neurons_max.value))
+        n_max = max(int(neurons_min.value), int(neurons_max.value))
+
+        brain_radius = 28.0
+        clusters = generate_clusters(n_areas, brain_radius, rng, bool(brain_like_mode.value))
+
+        # Each area contributes a random neuron count in [n_min, n_max].
+        area_counts = [int(rng.integers(n_min, n_max + 1)) for _ in range(n_areas)]
+        neurons = generate_neurons(sum(area_counts), brain_radius, rng, bool(brain_like_mode.value))
+        assign_clusters(neurons, clusters)
+
         edges = build_connections(
             neurons, clusters,
-            sigma=float(sigma.value), p_long=float(long_prob.value),
-            rng=rng, brain_like_mode=bool(brain_like_mode.value),
+            k_local=int(k_neighbors.value),
+            p_cross=float(p_cross.value),
+            rng=rng,
+            brain_like_mode=bool(brain_like_mode.value),
         )
-        fig = visualize(neurons, clusters, edges, float(brain_radius.value))
+        fig = visualize(neurons, edges, brain_radius)
 
         plot_holder.clear()
         with plot_holder:
             ng.plotly(fig).style("width: 100%; height: 80vh;")
 
-        local_edges = sum(1 for e in edges if e.type == "local")
+        local_count = sum(1 for e in edges if e.type == "local")
+        actual_sizes = sorted(len(c.neuron_ids) for c in clusters)
         stats.text = (
-            f"Generated {len(clusters)} clusters, {len(neurons)} neurons, "
-            f"{local_edges} local edges, {len(edges) - local_edges} long-range edges."
+            f"{n_areas} areas · {len(neurons)} neurons  (per area: {actual_sizes}) · "
+            f"{local_count} local edges · {len(edges) - local_count} cross-area bridges"
         )
 
     with container:
