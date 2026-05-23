@@ -13,8 +13,6 @@ _CLUSTER_PLACEMENT_FRAC = 0.88
 _BETA_A = 2.2
 _BETA_B = 4.8
 
-# --- Connectivity ---
-_SMALL_WORLD_RATE = 0.008
 
 # --- Visualization ---
 _LOCAL_EDGE_OPACITY = 0.35
@@ -94,11 +92,9 @@ def generate_clusters(
     brain_radius: float,
     rng: np.random.Generator,
     brain_like_mode: bool,
-    inner_frac: float,
-    outer_frac: float,
 ) -> list[Cluster]:
-    min_r = inner_frac * brain_radius
-    max_r = max(min_r + 1.0, outer_frac * brain_radius * _CLUSTER_PLACEMENT_FRAC)
+    min_r = 0.0
+    max_r = brain_radius * _CLUSTER_PLACEMENT_FRAC
     min_separation = max(1.5, brain_radius / (2.0 * num_clusters))
 
     clusters: list[Cluster] = []
@@ -122,11 +118,9 @@ def generate_neurons(
     brain_radius: float,
     rng: np.random.Generator,
     brain_like_mode: bool,
-    inner_frac: float,
-    outer_frac: float,
 ) -> list[Neuron]:
-    min_r = inner_frac * brain_radius
-    max_r = max(min_r + 0.5, outer_frac * brain_radius)
+    min_r = 0.0
+    max_r = brain_radius
 
     neurons: list[Neuron] = []
     for nid in range(num_neurons):
@@ -148,99 +142,42 @@ def assign_clusters(neurons: list[Neuron], clusters: list[Cluster]) -> None:
         clusters[cid].neuron_ids.append(neuron_idx)
 
 
-def build_connections(
-    neurons: list[Neuron],
-    clusters: list[Cluster],
-    k_local: int,
-    p_cross: float,
-    rng: np.random.Generator,
-    brain_like_mode: bool,
-) -> list[Edge]:
-    edges: list[Edge] = []
+def build_connections(neurons: list[Neuron], k: int) -> list[Edge]:
+    """Global k-nearest-neighbor pass over all neurons, area-blind.
+
+    Every neuron connects to its k spatially closest neighbors regardless of
+    which Voronoi area they belong to. Edges that happen to cross an area
+    boundary are classified as 'cross' and colored red at render time; all
+    others are 'local'. No explicit cross-area bridges or small-world wiring.
+    """
+    n = len(neurons)
+    if n < 2:
+        return []
+
     positions = np.array([n.position for n in neurons], dtype=float)
+    dists = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
+    np.fill_diagonal(dists, np.inf)
+
+    k = min(k, n - 1)
+    edges: list[Edge] = []
     seen: set[tuple[int, int]] = set()
 
-    # Local: k-nearest neighbors within each area.
-    for cluster in clusters:
-        ids = np.array(cluster.neuron_ids, dtype=int)
-        if ids.size < 2:
-            continue
-        local_pos = positions[ids]
-        dist = np.linalg.norm(local_pos[:, None, :] - local_pos[None, :, :], axis=2)
-        np.fill_diagonal(dist, np.inf)
-        k = min(k_local, ids.size - 1)
-        for i_local in range(ids.size):
-            for j_local in np.argsort(dist[i_local])[:k]:
-                i_g, j_g = int(ids[i_local]), int(ids[int(j_local)])
-                key = (min(i_g, j_g), max(i_g, j_g))
-                if key in seen:
-                    continue
-                seen.add(key)
-                d = float(dist[i_local, int(j_local)])
-                weight = float(np.clip(1.0 / (1.0 + d * 0.3), 0.05, 1.0))
-                edges.append(Edge(source=i_g, target=j_g, weight=weight, type="local", cluster_id=cluster.id))
-
-    # Cross-area: each neuron in the smaller area independently tries to bridge once.
-    for left in range(len(clusters)):
-        for right in range(left + 1, len(clusters)):
-            left_ids  = clusters[left].neuron_ids
-            right_ids = clusters[right].neuron_ids
-            if not left_ids or not right_ids:
-                continue
-            smaller, larger = (
-                (left_ids, right_ids) if len(left_ids) <= len(right_ids) else (right_ids, left_ids)
-            )
-            for i in smaller:
-                if rng.random() < p_cross:
-                    j = int(rng.choice(larger))
-                    edges.append(Edge(source=int(i), target=j, weight=0.4, type="cross", cluster_id=-1))
-
-    # Small-world: sparse extra cross-area bridges in brain-like mode.
-    if brain_like_mode and len(neurons) > 3:
-        for _ in range(max(1, int(_SMALL_WORLD_RATE * len(neurons)))):
-            i = int(rng.integers(0, len(neurons)))
-            j = int(rng.integers(0, len(neurons)))
-            if i != j and neurons[i].cluster_id != neurons[j].cluster_id:
-                edges.append(Edge(source=i, target=j, weight=0.3, type="cross", cluster_id=-1))
-
-    # Guarantee: any neuron that still has degree 0 (e.g. a single-neuron Voronoi cell)
-    # gets connected to its k global nearest neighbors regardless of area boundary.
-    degree: dict[int, int] = {i: 0 for i in range(len(neurons))}
-    for e in edges:
-        degree[e.source] += 1
-        degree[e.target] += 1
-
-    for i_g, deg in degree.items():
-        if deg > 0:
-            continue
-        global_dists = np.linalg.norm(positions - positions[i_g], axis=1)
-        global_dists[i_g] = np.inf
-        for j_g in np.argsort(global_dists)[:min(k_local, len(neurons) - 1)]:
-            j_g = int(j_g)
-            key = (min(i_g, j_g), max(i_g, j_g))
+    for i in range(n):
+        for j in map(int, np.argsort(dists[i])[:k]):
+            key = (min(i, j), max(i, j))
             if key in seen:
                 continue
             seen.add(key)
-            same = neurons[j_g].cluster_id == neurons[i_g].cluster_id
-            cid  = neurons[i_g].cluster_id
-            d    = float(global_dists[j_g])
+            d = float(dists[i, j])
             weight = float(np.clip(1.0 / (1.0 + d * 0.3), 0.05, 1.0))
+            same = neurons[i].cluster_id == neurons[j].cluster_id
             edges.append(Edge(
-                source=i_g, target=j_g, weight=weight,
+                source=i, target=j, weight=weight,
                 type="local" if same else "cross",
-                cluster_id=cid if same else -1,
+                cluster_id=neurons[i].cluster_id if same else -1,
             ))
 
     return edges
-
-
-def _bubble_radius(cluster: Cluster, positions: np.ndarray) -> float:
-    """75th-percentile distance from cluster center to its neurons."""
-    if not cluster.neuron_ids:
-        return 4.0
-    pts   = positions[cluster.neuron_ids]
-    dists = np.linalg.norm(pts - cluster.center, axis=1)
-    return float(np.percentile(dists, 75))
 
 
 def _make_sphere_surface(center: np.ndarray, radius: float, color: str) -> go.Surface:
@@ -260,12 +197,37 @@ def _make_sphere_surface(center: np.ndarray, radius: float, color: str) -> go.Su
     )
 
 
+def _make_area_hull(
+    cluster: Cluster, positions: np.ndarray, color: str
+) -> go.Mesh3d | go.Surface | None:
+    """Organic convex-hull bubble following the actual shape of the neuron cloud."""
+    if not cluster.neuron_ids:
+        return None
+    pts = positions[cluster.neuron_ids]
+    if len(pts) < 4:
+        center = pts.mean(axis=0)
+        return _make_sphere_surface(center, 5.0, color)
+    centroid = pts.mean(axis=0)
+    expanded = centroid + (pts - centroid) * 1.18
+    return go.Mesh3d(
+        x=expanded[:, 0], y=expanded[:, 1], z=expanded[:, 2],
+        alphahull=0,
+        opacity=_BUBBLE_OPACITY,
+        color=color,
+        hoverinfo="skip",
+        showlegend=False,
+        name="hull",
+        flatshading=True,
+    )
+
+
 def visualize(
     neurons: list[Neuron],
     edges: list[Edge],
     clusters: list[Cluster],
     brain_radius: float,
     show_bubbles: bool = False,
+    show_bridges: bool = True,
     hidden_areas: set[int] | None = None,
     max_edges_render: int = 4000,
 ) -> go.Figure:
@@ -284,7 +246,9 @@ def visualize(
             if cluster.id in hidden_areas:
                 continue
             color = _CLUSTER_PALETTE[cluster.id % len(_CLUSTER_PALETTE)]
-            fig.add_trace(_make_sphere_surface(cluster.center, _bubble_radius(cluster, positions), color))
+            hull = _make_area_hull(cluster, positions, color)
+            if hull is not None:
+                fig.add_trace(hull)
 
     if vis_neurons:
         vis_pos    = np.array([n.position for n in vis_neurons], dtype=float)
@@ -297,30 +261,39 @@ def visualize(
             hovertemplate="Neuron %{pointNumber}<extra></extra>",
         ))
 
-    # Filter edges: only draw when both endpoints are in visible areas.
-    vis_edges = [e for e in edges if e.source in vis_ids and e.target in vis_ids][:max_edges_render]
+    # Collect local edges per cluster and all cross-area edges, then apply a
+    # per-cluster render limit so high-k settings never starve later clusters.
+    local_segs_by_cid: dict[int, list[tuple]] = {}
+    cross_segs: list[tuple] = []
+    for edge in edges:
+        if edge.source not in vis_ids or edge.target not in vis_ids:
+            continue
+        p1, p2 = positions[edge.source], positions[edge.target]
+        seg = (
+            [float(p1[0]), float(p2[0]), None],
+            [float(p1[1]), float(p2[1]), None],
+            [float(p1[2]), float(p2[2]), None],
+        )
+        if edge.type == "local":
+            local_segs_by_cid.setdefault(edge.cluster_id, []).append(seg)
+        else:
+            cross_segs.append(seg)
+
+    n_areas = max(1, len(local_segs_by_cid))
+    per_cluster_limit = max(300, max_edges_render // n_areas)
 
     local_by_cluster: dict[int, tuple[list[float | None], list[float | None], list[float | None]]] = {}
-    cross_x: list[float | None] = []
-    cross_y: list[float | None] = []
-    cross_z: list[float | None] = []
+    for cid, segs in local_segs_by_cid.items():
+        limited = segs[:per_cluster_limit]
+        local_by_cluster[cid] = (
+            [v for s in limited for v in s[0]],
+            [v for s in limited for v in s[1]],
+            [v for s in limited for v in s[2]],
+        )
 
-    for edge in vis_edges:
-        p1, p2 = positions[edge.source], positions[edge.target]
-        xs: list[float | None] = [float(p1[0]), float(p2[0]), None]
-        ys: list[float | None] = [float(p1[1]), float(p2[1]), None]
-        zs: list[float | None] = [float(p1[2]), float(p2[2]), None]
-        if edge.type == "local":
-            if edge.cluster_id not in local_by_cluster:
-                local_by_cluster[edge.cluster_id] = ([], [], [])
-            lx, ly, lz = local_by_cluster[edge.cluster_id]
-            lx += xs
-            ly += ys
-            lz += zs
-        else:
-            cross_x += xs
-            cross_y += ys
-            cross_z += zs
+    cross_x: list[float | None] = [v for s in cross_segs for v in s[0]]
+    cross_y: list[float | None] = [v for s in cross_segs for v in s[1]]
+    cross_z: list[float | None] = [v for s in cross_segs for v in s[2]]
 
     for cid, (lx, ly, lz) in local_by_cluster.items():
         color = _CLUSTER_PALETTE[cid % len(_CLUSTER_PALETTE)]
@@ -332,7 +305,7 @@ def visualize(
             name=f"area {cid}",
         ))
 
-    if cross_x:
+    if cross_x and show_bridges:
         fig.add_trace(go.Scatter3d(
             x=cross_x, y=cross_y, z=cross_z,
             mode="lines",
@@ -452,23 +425,13 @@ def ui() -> None:
             neurons_max = slider_field("Max neurons / area", 10, 300, 120, 5, lambda v: f"{int(v)}")
 
             divider()
-            section("NEURON SHELL")
-            inner_radius = slider_field("Inner radius", 0, 80, 15, 5, lambda v: f"{int(v)} %")
-            outer_radius = slider_field("Outer radius", 20, 100, 95, 5, lambda v: f"{int(v)} %")
-
-            divider()
             section("CONNECTIVITY")
-            k_neighbors = slider_field("Local neighbors  K", 1, 12, 4, 1, lambda v: f"{int(v)}")
-            p_cross     = slider_field("Cross-area bridges", 0.000, 0.150, 0.020, 0.005, lambda v: f"{v:.3f}")
+            k_neighbors = slider_field("Neighbors  K", 1, 12, 4, 1, lambda v: f"{int(v)}")
 
             divider()
             section("OPTIONS")
             brain_like_mode = toggle_row(
                 "Brain-like mode", "Dense core · small-world bridges", True,
-            )
-            show_bubbles = toggle_row(
-                "Area bubbles", "Translucent shell per Voronoi area", False,
-                on_change=lambda _: rerender(),
             )
             seed = slider_field("Random seed", 0, 9999, 42, 1, lambda v: f"{int(v)}")
 
@@ -478,11 +441,18 @@ def ui() -> None:
             ).style("font-weight:700; letter-spacing:0.07em; margin-top:0.2rem;")
             stats = ng.label("—").classes("stat-text").style("margin-top:0.3rem;")
 
-        # ── 3-D plot + overlay (position:relative so overlay can anchor to it) ─
-        plot_holder = ng.column().style(
+        # ── 3-D plot + floating legend (siblings inside a position:relative wrapper) ─
+        with ng.column().style(
             f"flex:1 1 0; height:100vh; overflow:hidden; "
             f"background:{_PAGE_BG}; position:relative;"
-        )
+        ):
+            plot_container   = ng.column().style("width:100%; height:100%;")
+            legend_container = ng.column().style(
+                "position:absolute; top:1.1rem; right:1.1rem; z-index:1000; "
+                "background:rgba(10,10,22,0.86); border:1px solid #252538; "
+                "border-radius:10px; padding:0.65rem 0.75rem 0.7rem; gap:0.22rem; "
+                "min-width:164px;"
+            )
 
     state: dict = {}
 
@@ -495,59 +465,84 @@ def ui() -> None:
         state["hidden_areas"] = hidden
         rerender()
 
-    def rerender() -> None:
+    def toggle_bridges() -> None:
+        state["show_bridges"] = not state.get("show_bridges", True)
+        rerender()
+
+    def toggle_bubbles() -> None:
+        state["show_bubbles"] = not state.get("show_bubbles", False)
+        rerender()
+
+    def _rebuild_legend() -> None:
+        hidden = state.get("hidden_areas", set())
+        legend_container.clear()
+        with legend_container:
+            # Header row: title + bridge + bubble icon toggles
+            with ng.row().classes("items-center").style("gap:0.25rem; padding-bottom:0.22rem;"):
+                ng.label("AREAS").style(
+                    f"font-size:0.55rem; font-weight:700; letter-spacing:0.16em; "
+                    f"color:{_ACCENT}; flex:1;"
+                )
+                bridges_on = state.get("show_bridges", True)
+                ng.button(icon="share", on_click=lambda: toggle_bridges()).props(
+                    "flat dense size=xs round"
+                ).style(f"color:{_ACCENT if bridges_on else '#2a2a40'};").tooltip(
+                    "Inter-area connections"
+                )
+                bubbles_on = state.get("show_bubbles", False)
+                ng.button(icon="bubble_chart", on_click=lambda: toggle_bubbles()).props(
+                    "flat dense size=xs round"
+                ).style(f"color:{_ACCENT if bubbles_on else '#2a2a40'};").tooltip(
+                    "Area bubbles"
+                )
+            ng.separator().style(
+                "background:#1a1a2c; height:1px; border:none; margin:0.08rem 0 0.18rem;"
+            )
+            for cluster in state["clusters"]:
+                color     = _CLUSTER_PALETTE[cluster.id % len(_CLUSTER_PALETTE)]
+                cid       = cluster.id
+                is_hidden = cid in hidden
+                n_count   = len(cluster.neuron_ids)
+                dot_op    = "0.18" if is_hidden else "1"
+                lbl_col   = "#2c2c44" if is_hidden else "#aeaec8"
+                cnt_col   = "#242438" if is_hidden else "#3e3e58"
+                btn_col   = "#252538" if is_hidden else _ACCENT
+                with ng.row().classes("items-center").style("gap:0.38rem;"):
+                    ng.button(
+                        icon="visibility_off" if is_hidden else "visibility",
+                        on_click=lambda c=cid: toggle_area(c),
+                    ).props("flat dense size=xs round").style(f"color:{btn_col};")
+                    ng.html(
+                        f'<div style="width:9px;height:9px;border-radius:50%;'
+                        f'background:{color};opacity:{dot_op};flex-shrink:0;"></div>'
+                    )
+                    ng.label(f"Area {cid + 1}").style(
+                        f"font-size:0.7rem; color:{lbl_col}; flex:1; min-width:3.2rem;"
+                    )
+                    ng.label(str(n_count)).style(f"font-size:0.62rem; color:{cnt_col};")
+
+    def rerender(*, hard: bool = False) -> None:
         if not state:
             return
-        hidden = state.get("hidden_areas", set())
         fig = visualize(
             state["neurons"],
             state["edges"],
             state["clusters"],
             state["brain_radius"],
-            show_bubbles=bool(show_bubbles.value),
-            hidden_areas=hidden,
+            show_bubbles=state.get("show_bubbles", False),
+            show_bridges=state.get("show_bridges", True),
+            hidden_areas=state.get("hidden_areas"),
         )
-
-        plot_holder.clear()
-        with plot_holder:
-            ng.plotly(fig).style("width:100%; height:100vh;")
-
-            # ── Floating area legend, top-right ──────────────────────────────
-            with ng.column().style(
-                "position:absolute; top:1.1rem; right:1.1rem; z-index:1000; "
-                "background:rgba(10,10,22,0.86); border:1px solid #252538; "
-                "border-radius:10px; padding:0.65rem 0.75rem 0.7rem; gap:0.22rem; "
-                "min-width:158px;"
-            ):
-                ng.label("AREAS").style(
-                    f"font-size:0.55rem; font-weight:700; letter-spacing:0.16em; "
-                    f"color:{_ACCENT}; padding-bottom:0.18rem;"
-                )
-                for cluster in state["clusters"]:
-                    color    = _CLUSTER_PALETTE[cluster.id % len(_CLUSTER_PALETTE)]
-                    cid      = cluster.id
-                    is_hidden = cid in hidden
-                    n_count  = len(cluster.neuron_ids)
-                    dot_op   = "0.18" if is_hidden else "1"
-                    lbl_col  = "#2c2c44" if is_hidden else "#aeaec8"
-                    cnt_col  = "#242438" if is_hidden else "#3e3e58"
-                    btn_col  = "#252538" if is_hidden else _ACCENT
-
-                    with ng.row().classes("items-center").style("gap:0.38rem;"):
-                        ng.html(
-                            f'<div style="width:9px;height:9px;border-radius:50%;'
-                            f'background:{color};opacity:{dot_op};flex-shrink:0;"></div>'
-                        )
-                        ng.label(f"Area {cid + 1}").style(
-                            f"font-size:0.7rem; color:{lbl_col}; flex:1; min-width:3.2rem;"
-                        )
-                        ng.label(str(n_count)).style(
-                            f"font-size:0.62rem; color:{cnt_col};"
-                        )
-                        ng.button(
-                            icon="visibility_off" if is_hidden else "visibility",
-                            on_click=lambda c=cid: toggle_area(c),
-                        ).props("flat dense size=xs round").style(f"color:{btn_col};")
+        # Soft rerender: update figure in-place so Plotly.react() is used and
+        # the 3-D camera position is preserved.  Hard rerender (after generate)
+        # recreates the element to pick up any structural changes.
+        if hard or "plot_el" not in state:
+            plot_container.clear()
+            with plot_container:
+                state["plot_el"] = ng.plotly(fig).style("width:100%; height:100vh;")
+        else:
+            state["plot_el"].update_figure(fig)
+        _rebuild_legend()
 
     def regenerate() -> None:
         rng     = np.random.default_rng(int(seed.value))
@@ -556,29 +551,23 @@ def ui() -> None:
         n_max   = max(int(neurons_min.value), int(neurons_max.value))
         brain_r = 28.0
 
-        inner = float(inner_radius.value) / 100.0
-        outer = max(inner + 0.05, float(outer_radius.value) / 100.0)
-
-        clusters = generate_clusters(n_areas, brain_r, rng, bool(brain_like_mode.value), inner, outer)
+        clusters = generate_clusters(n_areas, brain_r, rng, bool(brain_like_mode.value))
         total    = sum(int(rng.integers(n_min, n_max + 1)) for _ in range(n_areas))
-        neurons  = generate_neurons(total, brain_r, rng, bool(brain_like_mode.value), inner, outer)
+        neurons  = generate_neurons(total, brain_r, rng, bool(brain_like_mode.value))
         assign_clusters(neurons, clusters)
-        edges    = build_connections(
-            neurons, clusters,
-            k_local=int(k_neighbors.value),
-            p_cross=float(p_cross.value),
-            rng=rng,
-            brain_like_mode=bool(brain_like_mode.value),
-        )
+        edges    = build_connections(neurons, k=int(k_neighbors.value))
 
+        # Preserve view toggles across generations; reset area visibility.
+        state.setdefault("show_bridges", True)
+        state.setdefault("show_bubbles", False)
         state.update({
             "neurons":      neurons,
             "clusters":     clusters,
             "edges":        edges,
             "brain_radius": brain_r,
-            "hidden_areas": set(),   # reset visibility on new generation
+            "hidden_areas": set(),
         })
-        rerender()
+        rerender(hard=True)
 
         local_count = sum(1 for e in edges if e.type == "local")
         sizes = sorted(len(c.neuron_ids) for c in clusters)
